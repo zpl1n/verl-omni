@@ -250,6 +250,21 @@ def _transformer_schema(base: Path, source_config_path: Path, architecture: str)
     cls = _transformer_class(architecture)
     base_config = read_json(base / "config.json")
     source_config = read_json(source_config_path)
+    # VeOmni saves a Transformers config around the same Diffusers architecture.
+    # Only discard backend metadata when that native model identity agrees.
+    if source_config.get("model_type") == cls.__name__:
+        source_config = {
+            key: value
+            for key, value in source_config.items()
+            if key
+            not in {
+                "model_type",
+                "transformers_version",
+                "ops_implementation",
+                "encoder_data_balance",
+                "tie_word_embeddings",
+            }
+        }
     fields = set(inspect.signature(cls.__init__).parameters) - {"self"}
     for config in (base_config, source_config):
         if config.get("_class_name") != cls.__name__:

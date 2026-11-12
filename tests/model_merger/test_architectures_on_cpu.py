@@ -33,6 +33,7 @@ from verl_omni.model_merger.fsdp_model_merger import (
     _h3_conversion_plan,
     _h3_native_name,
     _pipeline_class,
+    _transformer_schema,
 )
 from verl_omni.model_merger.utils import inventory, read_json, tree_files, weight_files, write_json
 
@@ -526,6 +527,31 @@ def test_component_directory_symlinks_cannot_escape_base(tmp_path):
     with pytest.raises(ValueError, match="directory symlinks"):
         merge_model(replace(config, output_format="transformer"))
     assert not Path(config.target_dir).exists()
+
+
+@pytest.mark.parametrize("architecture", ["QwenImagePipeline", "QwenImage21Pipeline"])
+def test_veomni_checkpoint_metadata_keeps_architecture_validation(tmp_path, architecture):
+    config, model = _case(tmp_path, architecture)
+    source_path = Path(config.hf_model_config_path) / "config.json"
+    source = read_json(source_path)
+    source.update(
+        model_type=type(model).__name__,
+        transformers_version="5.16.1",
+        ops_implementation={"attn_implementation": "eager"},
+        encoder_data_balance=False,
+        tie_word_embeddings=False,
+    )
+    write_json(source_path, source)
+    shapes, _ = _transformer_schema(Path(config.base_model), source_path, architecture)
+    assert shapes == {name: tuple(value.shape) for name, value in model.state_dict().items()}
+    for updates, message in (
+        ({"model_type": "WrongTransformer"}, "Unrecognized"),
+        ({"unknown_geometry": 12}, "Unrecognized"),
+        ({"num_layers": 2}, "configuration mismatch"),
+    ):
+        write_json(source_path, source | updates)
+        with pytest.raises(ValueError, match=message):
+            _transformer_schema(Path(config.base_model), source_path, architecture)
 
 
 def test_registry_covers_repository_diffusers_training_architectures():

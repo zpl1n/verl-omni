@@ -86,4 +86,12 @@ run_test 12 "CRD SD3 v1 sync trainer and checkpoint e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
     bash tests/special_e2e/run_crd_sd35.sh "${diffusion_trainer_args[@]}"
 
+# The native transformer currently requires the external VeOmni adaptation branch.
+# Opt in after installing it; existing smoke images only carry the released backend.
+if [[ "${QWEN_IMAGE_21_VEOMNI_SMOKE:-0}" == "1" ]]; then
+    run_test 13 "Qwen-Image-2.1 FlowGRPO VeOmni v1 sync trainer e2e" \
+        env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
+        bash tests/special_e2e/run_flowgrpo_qwen_image_21_veomni.sh "${diffusion_trainer_args[@]}"
+fi
+
 gpu_smoke_summary

@@ -117,16 +117,34 @@ class VeOmniDiffusionEngine(BaseEngine):
         self.dp_replicate_size = dp_replicate_size
         self.dp_shard_size = dp_shard_size
 
-        parallel_state.init_parallel_state(
-            dp_size=dp_size,
-            dp_replicate_size=dp_replicate_size,
-            dp_shard_size=dp_shard_size,
-            extra_parallel_sizes=(self.engine_config.expert_parallel_size,),
-            ulysses_size=self.engine_config.ulysses_parallel_size,
-            dp_mode="fsdp2",
-        )
+        # VeOmni's model-runtime API moved mesh construction onto AcceleratorConfig.
+        self._uses_model_runtime = hasattr(parallel_state, "init_parallel_state_from_config")
+        self._runtime_name = "verl_diffusion_ref" if self.engine_config.forward_only else "verl_diffusion_actor"
+        if self._uses_model_runtime:
+            from veomni.arguments import AcceleratorConfig, FSDPConfig
 
-        ps = parallel_state.get_parallel_state()
+            accelerator = AcceleratorConfig(
+                dp_replicate_size=dp_replicate_size,
+                dp_shard_size=dp_shard_size,
+                ep_size=self.engine_config.expert_parallel_size,
+                ulysses_size=self.engine_config.ulysses_parallel_size,
+                init_device=self.engine_config.init_device,
+                fsdp_config=FSDPConfig(fsdp_mode="fsdp2"),
+            )
+            parallel_state.init_parallel_state_from_config(accelerator, self._runtime_name)
+            ps = parallel_state.get_parallel_state_by_name(self._runtime_name)
+        else:
+            parallel_state.init_parallel_state(
+                dp_size=dp_size,
+                dp_replicate_size=dp_replicate_size,
+                dp_shard_size=dp_shard_size,
+                extra_parallel_sizes=(self.engine_config.expert_parallel_size,),
+                ulysses_size=self.engine_config.ulysses_parallel_size,
+                dp_mode="fsdp2",
+            )
+            ps = parallel_state.get_parallel_state()
+
+        self._parallel_state = ps
         self.device_mesh = ps.device_mesh
         self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.engine_config.ulysses_parallel_size
@@ -220,6 +238,16 @@ class VeOmniDiffusionEngine(BaseEngine):
             forward_prefetch=self.engine_config.forward_prefetch,
             mixed_precision=mixed_precision,
         )
+        gradient_checkpointing = GradientCheckpointingConfig(
+            enable=self.model_config.enable_gradient_checkpointing,
+            enable_reentrant=self.engine_config.enable_reentrant,
+        )
+        uses_model_runtime = "accelerator" in {field.name for field in fields(DiTModelArguments)}
+        accelerator_kwargs = (
+            {"init_device": self.engine_config.init_device, "gradient_checkpointing": gradient_checkpointing}
+            if uses_model_runtime
+            else {}
+        )
         accelerator = AcceleratorConfig(
             dp_replicate_size=dp_replicate_size,
             dp_shard_size=dp_shard_size,
@@ -230,6 +258,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                 enable_activation=self.engine_config.enable_activation_offload,
                 activation_gpu_limit=self.engine_config.activation_gpu_limit,
             ),
+            **accelerator_kwargs,
         )
         optimizer = OptimizerConfig(
             type=self.optimizer_config.optimizer,
@@ -242,22 +271,27 @@ class VeOmniDiffusionEngine(BaseEngine):
             weight_decay=self.optimizer_config.weight_decay,
             max_grad_norm=self.optimizer_config.clip_grad,
         )
+        model_kwargs = {}
+        train_kwargs = {}
+        if uses_model_runtime:
+            model_kwargs.update(accelerator=accelerator, optimizer=optimizer, broadcast_model_weights_from_rank0=True)
+        else:
+            train_kwargs.update(
+                init_device=self.engine_config.init_device,
+                broadcast_model_weights_from_rank0=True,
+                optimizer=optimizer,
+                gradient_checkpointing=gradient_checkpointing,
+                accelerator=accelerator,
+            )
         train_args = DiTTrainingArguments(
             dyn_bsz=False,
             micro_batch_size=1,
             global_batch_size=dp_size,
             num_train_epochs=1,
-            init_device=self.engine_config.init_device,
-            broadcast_model_weights_from_rank0=True,
             enable_full_determinism=self.engine_config.full_determinism,
             seed=self.engine_config.seed,
-            optimizer=optimizer,
-            gradient_checkpointing=GradientCheckpointingConfig(
-                enable=self.model_config.enable_gradient_checkpointing,
-                enable_reentrant=self.engine_config.enable_reentrant,
-            ),
-            accelerator=accelerator,
             training_task="offline_training",
+            **train_kwargs,
         )
         train_args._train_steps = self.optimizer_config.total_training_steps
 
@@ -272,6 +306,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                 basic_modules=[],
                 lora_config=self._build_veomni_lora_config(),
                 ops_implementation=self._build_ops_config(),
+                **model_kwargs,
             ),
             data=DiTDataArguments(train_path=self.model_config.local_path, text_keys="messages"),
             train=train_args,
@@ -291,6 +326,31 @@ class VeOmniDiffusionEngine(BaseEngine):
         return trainer
 
     def _build_model_optimizer(self):
+        if self._uses_model_runtime:
+            from veomni.distributed.offloading import build_activation_offloading_context
+
+            from verl_omni.workers.engine.veomni.model_runtime import VerlDiffusionModelRuntime
+
+            args = self._build_veomni_dit_args()
+            self.veomni_runtime = VerlDiffusionModelRuntime(
+                args.model,
+                self._runtime_name,
+                train=args.train,
+                engine_config=self.engine_config,
+            )
+            if not self.engine_config.forward_only:
+                self.veomni_runtime._build_lr_scheduler(self.optimizer_config.total_training_steps)
+            self.module = self.veomni_runtime.model
+            self.optimizer = self.veomni_runtime.optimizer
+            self.lr_scheduler = self.veomni_runtime.lr_scheduler
+            self.scheduler = self._build_scheduler()
+            self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
+                self.engine_config.enable_activation_offload,
+                self.model_config.enable_gradient_checkpointing,
+                self.engine_config.activation_gpu_limit,
+            )
+            return
+
         from veomni.trainer.base import BaseTrainer
 
         self.veomni_trainer = self._build_veomni_dit_trainer()
@@ -342,25 +402,25 @@ class VeOmniDiffusionEngine(BaseEngine):
         return EngineEvalModeCtx(self, **kwargs)
 
     def get_data_parallel_rank(self):
-        from veomni.distributed import parallel_state
-
-        return parallel_state.get_parallel_state().dp_rank
+        return self._parallel_state.dp_rank
 
     def get_data_parallel_size(self):
-        from veomni.distributed import parallel_state
-
-        return parallel_state.get_parallel_state().dp_size
+        return self._parallel_state.dp_size
 
     def get_data_parallel_group(self):
-        from veomni.distributed import parallel_state
-
-        return parallel_state.get_parallel_state().dp_group
+        return self._parallel_state.dp_group
 
     def is_mp_src_rank_with_outputs(self):
-        from veomni.distributed import parallel_state
-
-        ps = parallel_state.get_parallel_state()
+        ps = self._parallel_state
         return ps.sp_rank == 0 if ps.sp_enabled else True
+
+    def parallel_context(self):
+        """Activate the owning model's mesh when actor and reference share a process."""
+        if self._uses_model_runtime:
+            from veomni.distributed.parallel_state import use_parallel_state
+
+            return use_parallel_state(self._runtime_name)
+        return nullcontext()
 
     @staticmethod
     def _unpad_nested_embeds(embeds: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -486,6 +546,10 @@ class VeOmniDiffusionEngine(BaseEngine):
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
+        with self.parallel_context():
+            return self._forward_backward_batch(data, loss_function, forward_only)
+
+    def _forward_backward_batch(self, data, loss_function, forward_only):
         num_timesteps = int(data["all_timesteps"].shape[1])
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         tu.assign_non_tensor(data, use_dynamic_bsz=False)

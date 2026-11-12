@@ -1,0 +1,17 @@
+{{- '<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n' -}}
+{%- set users = messages | selectattr('role', 'equalto', 'user') | list -%}
+{%- if users | length != 1 -%}
+    {{- raise_exception('Qwen-Image-2.1 T2I requires exactly one user message.') -}}
+{%- endif -%}
+{{- '<|im_start|>user\n' -}}
+{%- if users[0]['content'] is string -%}
+    {{- users[0]['content'] -}}
+{%- else -%}
+    {%- for item in users[0]['content'] -%}
+        {%- if item['type'] != 'text' -%}
+            {{- raise_exception('Qwen-Image-2.1 FlowGRPO supports text-to-image only.') -}}
+        {%- endif -%}
+        {{- item['text'] -}}
+    {%- endfor -%}
+{%- endif -%}
+{{- '<|im_end|>\n<|im_start|>assistant\n' -}}
